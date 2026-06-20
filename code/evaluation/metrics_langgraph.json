@@ -1,0 +1,161 @@
+{
+  "strategy": "langgraph",
+  "n_rows": 20,
+  "accuracy": {
+    "claim_status": 75.0,
+    "issue_type": 55.0,
+    "object_part": 90.0,
+    "evidence_standard_met": 85.0,
+    "valid_image": 85.0,
+    "severity": 50.0,
+    "risk_flags": 55.6
+  },
+  "mismatches": [
+    {
+      "row": 1,
+      "user_id": "user_002",
+      "field": "claim_status",
+      "predicted": "supported",
+      "expected": "not_enough_information"
+    },
+    {
+      "row": 1,
+      "user_id": "user_002",
+      "field": "issue_type",
+      "predicted": "scratch",
+      "expected": "broken_part"
+    },
+    {
+      "row": 1,
+      "user_id": "user_002",
+      "field": "evidence_standard_met",
+      "predicted": "true",
+      "expected": "false"
+    },
+    {
+      "row": 1,
+      "user_id": "user_002",
+      "field": "severity",
+      "predicted": "low",
+      "expected": "unknown"
+    },
+    {
+      "row": 2,
+      "user_id": "user_004",
+      "field": "severity",
+      "predicted": "high",
+      "expected": "medium"
+    },
+    {
+      "row": 3,
+      "user_id": "user_007",
+      "field": "issue_type",
+      "predicted": "crack",
+      "expected": "broken_part"
+    },
+    {
+      "row": 4,
+      "user_id": "user_005",
+      "field": "claim_status",
+      "predicted": "supported",
+      "expected": "contradicted"
+    },
+    {
+      "row": 4,
+      "user_id": "user_005",
+      "field": "issue_type",
+      "predicted": "dent",
+      "expected": "scratch"
+    },
+    {
+      "row": 7,
+      "user_id": "user_008",
+      "field": "claim_status",
+      "predicted": "supported",
+      "expected": "contradicted"
+    },
+    {
+      "row": 7,
+      "user_id": "user_008",
+      "field": "issue_type",
+      "predicted": "scratch",
+      "expected": "broken_part"
+    },
+    {
+      "row": 7,
+      "user_id": "user_008",
+      "field": "object_part",
+      "predicted": "hood",
+      "expected": "front_bumper"
+    },
+    {
+      "row": 7,
+      "user_id": "user_008",
+      "field": "valid_image",
+      "predicted": "true",
+      "expected": "false"
+    },
+    {
+      "row": 7,
+      "user_id": "user_008",
+      "field": "severity",
+      "predicted": "low",
+      "expected": "high"
+    },
+    {
+      "row": 8,
+      "user_id": "user_009",
+      "field": "severity",
+      "predicted": "high",
+      "expected": "medium"
+    },
+    {
+      "row": 9,
+      "user_id": "user_010",
+      "field": "issue_type",
+      "predicted": "crack",
+      "expected": "broken_part"
+    },
+    {
+      "row": 9,
+      "user_id": "user_010",
+      "field": "severity",
+      "predicted": "high",
+      "expected": "medium"
+    },
+    {
+      "row": 12,
+      "user_id": "user_018",
+      "field": "severity",
+      "predicted": "high",
+      "expected": "medium"
+    },
+    {
+      "row": 13,
+      "user_id": "user_020",
+      "field": "claim_status",
+      "predicted": "supported",
+      "expected": "contradicted"
+    },
+    {
+      "row": 13,
+      "user_id": "user_020",
+      "field": "issue_type",
+      "predicted": "scratch",
+      "expected": "none"
+    },
+    {
+      "row": 13,
+      "user_id": "user_020",
+      "field": "severity",
+      "predicted": "medium",
+      "expected": "none"
+    }
+  ],
+  "elapsed": 107.21151518821716,
+  "usage": {
+    "prompt_tokens": 78937,
+    "completion_tokens": 6085,
+    "calls": 60
+  }
+}
