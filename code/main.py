@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import csv
 import pathlib
 import shutil
 import sys
@@ -58,6 +59,10 @@ def parse_args() -> argparse.Namespace:
                    help="Quick test: process only first N rows")
     p.add_argument("--sample", action="store_true",
                    help="Run on sample_claims.csv instead of claims.csv")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip rows already present in submission/output.csv "
+                        "(only process missing ones, then merge). Useful when a "
+                        "prior run was interrupted by rate limits.")
     p.add_argument("--threads", type=int, default=2,
                    help="Parallel worker threads (default 2)")
     return p.parse_args()
@@ -195,6 +200,22 @@ def main() -> None:
 
     user_history_dict = load_user_history(history_path)
     requirements_list = load_evidence_requirements(requirements_path)
+
+    # ── Resume: load already-completed rows (keyed by image_paths) ────────────
+    done_rows: dict[str, dict] = {}
+    if args.resume and output_path.exists():
+        with open(output_path, newline="", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                done_rows[r.get("image_paths", "")] = r
+        pending = [(i, row) for i, row in enumerate(rows)
+                   if row["image_paths"] not in done_rows]
+        console.print(
+            f"  [green]--resume:[/green] {len(done_rows)} rows already done, "
+            f"{len(pending)} pending"
+        )
+    else:
+        pending = list(enumerate(rows))
+
     console.print(
         f"  {len(rows)} claims | {len(user_history_dict)} users "
         f"| {len(requirements_list)} requirements | [cyan]{args.threads} threads[/cyan]\n"
@@ -219,7 +240,7 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.threads) as pool:
                 futures = {
                     pool.submit(_process_row, idx, row, graph, configurable): idx
-                    for idx, row in enumerate(rows)
+                    for idx, row in pending
                 }
 
                 for future in as_completed(futures):
@@ -254,19 +275,24 @@ def main() -> None:
             console.print("\n[yellow]Interrupted.[/yellow]")
             aborted = True
 
-    if aborted and not results:
+    if aborted and not results and not done_rows:
         sys.exit(1)
 
-    # ── Write CSVs in row order ───────────────────────────────────────────────
+    # ── Write CSVs in original claims order, merging resumed rows ─────────────
     writer,      fh      = open_writer(run_output_path)
     writer_root, fh_root = open_writer(output_path)
 
-    for idx in sorted(results):
-        r = results[idx]
-        write_row(writer, r)
-        write_row(writer_root, r)
-        write_row_log(idx, r.get("_user_id", "?"), r.get("_model", "?"),
-                      r.get("claim_status", "?"), r.get("_errors", []))
+    for idx, row in enumerate(rows):
+        if idx in results:
+            r = results[idx]
+            write_row(writer, r)
+            write_row(writer_root, r)
+            write_row_log(idx, r.get("_user_id", "?"), r.get("_model", "?"),
+                          r.get("claim_status", "?"), r.get("_errors", []))
+        elif row["image_paths"] in done_rows:
+            raw = done_rows[row["image_paths"]]
+            writer.writerow(raw);      writer._fh.flush()
+            writer_root.writerow(raw); writer_root._fh.flush()
 
     close_writer(writer, fh)
     close_writer(writer_root, fh_root)

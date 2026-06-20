@@ -17,6 +17,10 @@ run:
 run-full:
 	$(PYTHON) code/main.py --threads 2 --skip-onboarding
 
+# ── Resume an interrupted full run: only process rows missing from output.csv ─
+resume:
+	$(PYTHON) code/main.py --resume --threads 1 --skip-onboarding
+
 # ── Run on sample_claims.csv (for manual inspection, 5 rows) ─────────────────
 run-sample:
 	$(PYTHON) code/main.py --sample --test 5 --threads 2 --skip-onboarding

@@ -27,8 +27,8 @@ make eval-both
 # Evaluate on test set (no scoring — just output.csv)
 make eval-test
 
-# Fresh run (clears LangGraph checkpoint cache)
-python code/main.py --fresh
+# Resume an interrupted run — only process rows missing from submission/output.csv
+make resume        # python code/main.py --resume --threads 1 --skip-onboarding
 ```
 
 ## File layout
