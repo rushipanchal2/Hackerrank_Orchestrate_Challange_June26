@@ -1,19 +1,21 @@
 """Main entry point: run the LangGraph pipeline on claims.csv → output.csv.
 
-Multi-threaded execution: available providers (gemini, groq, anthropic) each
-get a dedicated worker thread that processes claims in round-robin order.
-This gives ~2-3x speed-up when multiple API keys are configured.
-
-Real-time logging: every processed row is written to the AGENTS.md log file
-immediately after processing, and the log is flushed to disk on each write.
+Usage:
+  python code/main.py                   # full run on claims.csv
+  python code/main.py --test 5          # quick test on first 5 rows
+  python code/main.py --sample          # run on sample_claims.csv
+  python code/main.py --skip-onboarding # skip interactive agreement gate
 """
 
 import argparse
 import pathlib
+import shutil
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 try:
     from dotenv import load_dotenv
@@ -21,10 +23,13 @@ try:
 except ImportError:
     pass
 
-from tqdm import tqdm
-
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
 
 from code.graph.graph import build_graph
 from code.graph.state import default_state
@@ -33,8 +38,11 @@ from code.utils.csv_reader import (
     load_evidence_requirements,
     load_user_history,
 )
-from code.utils.logger import ensure_onboarding, write_row_log, write_turn
+from code.utils.logger import ensure_onboarding, log_path, write_row_log, write_turn
 from code.utils.output_writer import close_writer, open_writer, write_row
+
+console = Console()
+_table_lock = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,31 +52,77 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--images-dir", default="dataset", dest="images_dir")
     p.add_argument("--history", default="dataset/user_history.csv")
     p.add_argument("--requirements", default="dataset/evidence_requirements.csv")
-    p.add_argument("--fresh", action="store_true",
-                   help="Delete checkpoints.db before run (legacy; always fresh now)")
     p.add_argument("--skip-onboarding", action="store_true", dest="skip_onboarding")
-    p.add_argument("--delay", type=float, default=0.5,
-                   help="Seconds to sleep between rows per worker thread (default 0.5)")
-    p.add_argument("--workers", type=int, default=0,
-                   help="Number of parallel workers (0 = one per available provider)")
+    p.add_argument("--delay", type=float, default=0.0)
+    p.add_argument("--test", type=int, default=0, metavar="N",
+                   help="Quick test: process only first N rows")
+    p.add_argument("--sample", action="store_true",
+                   help="Run on sample_claims.csv instead of claims.csv")
+    p.add_argument("--threads", type=int, default=2,
+                   help="Parallel worker threads (default 2)")
     return p.parse_args()
 
 
 def _clean_db_files() -> None:
-    """Remove SQLite checkpoint files (db, WAL shm/wal) — not needed between runs."""
     for name in ("checkpoints.db", "checkpoints.db-shm", "checkpoints.db-wal"):
         p = pathlib.Path(name)
         if p.exists():
             p.unlink()
-            print(f"  Removed stale file: {name}")
 
 
-def _process_row(idx: int, row: dict, provider: str,
-                 configurable: dict, graph,
-                 delay: float, progress_lock: threading.Lock,
-                 pbar) -> dict:
-    """Process a single claim row. Returns the final state dict."""
-    thread_id = f"{idx:04d}_{row['user_id']}_{provider}"
+def _cleanup_old_runs(keep: int = 3) -> None:
+    """Delete old output/run_* folders, keeping the most recent `keep` runs."""
+    output_dir = _REPO_ROOT / "output"
+    if not output_dir.exists():
+        return
+    runs = sorted(output_dir.glob("run_*"), key=lambda p: p.name)
+    for old in runs[:-keep] if len(runs) > keep else []:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _run_folder(mode: str) -> pathlib.Path:
+    """Create timestamped output/run_TIMESTAMP_MODE/ folder."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = _REPO_ROOT / "output" / f"run_{ts}_{mode}"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _status_color(status: str) -> str:
+    return {"supported": "green", "contradicted": "red",
+            "not_enough_information": "yellow"}.get(status, "white")
+
+
+def _build_table(rows_done: list[dict], total: int) -> Table:
+    t = Table(show_header=True, header_style="bold", box=None,
+              title=f"Claims Progress: {len(rows_done)}/{total}")
+    t.add_column("#", width=4)
+    t.add_column("User", width=10)
+    t.add_column("Model", width=36)
+    t.add_column("Status", width=22)
+    t.add_column("Sev", width=6)
+    t.add_column("E", width=3)
+
+    for r in rows_done[-20:]:
+        status = r.get("claim_status", "?")
+        color = _status_color(status)
+        errs = len(r.get("_errors", []))
+        t.add_row(
+            str(r["_idx"]),
+            r.get("_user_id", "?")[:10],
+            r.get("_model", "?")[:36],
+            Text(status, style=color),
+            r.get("severity", "?")[:6],
+            str(errs) if errs else "",
+        )
+    return t
+
+
+def _process_row(idx: int, row: dict, graph, configurable: dict) -> dict:
+    """Process a single claim row. Runs in a thread pool worker."""
+    from code.utils import llm
+
+    thread_id = f"{idx:04d}_{row['user_id']}"
     state = default_state(
         user_id=row["user_id"],
         image_paths_raw=row["image_paths"],
@@ -76,168 +130,198 @@ def _process_row(idx: int, row: dict, provider: str,
         claim_object=row["claim_object"],
     )
 
-    from code.utils import llm as _llm
-    model = _llm._CFG[provider]["model"]
-
     try:
         final = graph.invoke(
             state,
-            config={"configurable": {**configurable, "thread_id": thread_id,
-                                     "provider": provider}},
+            config={"configurable": {**configurable, "thread_id": thread_id}},
         )
+        model_used = llm.active_model()
         errors = final.get("errors", [])
-        status = "ok" if not errors else f"errors({len(errors)})"
-        write_row_log(idx, row["user_id"], provider, model, status, errors)
-
-        with progress_lock:
-            pbar.update(1)
-            pbar.set_postfix({"provider": provider, "row": idx})
-
-        if delay > 0:
-            time.sleep(delay)
-        return {"idx": idx, "final": final, "error": None}
-
+    except SystemExit:
+        raise
     except Exception as exc:
-        write_row_log(idx, row["user_id"], provider, model,
-                      f"EXCEPTION: {type(exc).__name__}", [str(exc)])
-        fallback = dict(state)
-        fallback["claim_status_justification"] = f"Processing error: {exc}"
+        model_used = llm.active_model()
+        errors = [str(exc)]
+        final = dict(state)
+        final["claim_status_justification"] = f"Processing error: {exc}"
 
-        with progress_lock:
-            pbar.update(1)
-
-        return {"idx": idx, "final": fallback, "error": str(exc)}
+    final["_idx"] = idx
+    final["_model"] = model_used
+    final["_errors"] = errors
+    final["_user_id"] = row["user_id"]
+    return final
 
 
 def main() -> None:
     args = parse_args()
-
     ensure_onboarding(skip=args.skip_onboarding)
-
-    print("\n" + "=" * 64)
-    print("  Multi-Modal Evidence Review — inference")
-    print("=" * 64)
-
-    # Always start clean — remove stale checkpoint and previous output
     _clean_db_files()
-    prev_output = _REPO_ROOT / args.output
-    if prev_output.exists():
-        prev_output.unlink()
-        print(f"  Removed previous output: {prev_output.name}")
+    _cleanup_old_runs(keep=3)
 
-    # Provider selection — discovers all working providers for multi-threading
-    from code.utils import llm
-    print("\nSelecting LLM providers …")
-    llm.select_provider()
-    available = llm.get_available_providers()
+    # ── Determine mode and paths ──────────────────────────────────────────────
+    if args.sample:
+        mode = "sample"
+        claims_file = "dataset/sample_claims.csv"
+    elif args.test > 0:
+        mode = f"test{args.test}"
+        claims_file = args.claims
+    else:
+        mode = "full"
+        claims_file = args.claims
 
-    n_workers = args.workers if args.workers > 0 else max(1, len(available))
-    print(f"\n  Workers: {n_workers}  |  Providers: {available}")
-    print(f"  Round-robin assignment: row % {len(available)} → provider")
-    print(f"  Inter-row delay per worker: {args.delay}s")
+    run_dir = _run_folder(mode)
 
-    # Load data
     root = _REPO_ROOT
-    claims_path       = root / args.claims
-    output_path       = root / args.output
+    submission_dir    = root / "submission"
+    submission_dir.mkdir(exist_ok=True)
+    claims_path       = root / claims_file
+    output_path       = submission_dir / "output.csv"   # submission/output.csv
+    run_output_path   = run_dir / "output.csv"          # output/run_.../output.csv
     images_base       = root / args.images_dir
     history_path      = root / args.history
     requirements_path = root / args.requirements
 
-    print(f"\nLoading data from {claims_path.name} …")
+    # ── LiteLLM startup ──────────────────────────────────────────────────────
+    from code.utils import llm
+    console.print(f"\n[bold]Multi-Modal Evidence Review[/bold]  mode=[cyan]{mode}[/cyan]")
+    llm.startup_banner()
+    llm.reset_usage()
+
+    # ── Load data ─────────────────────────────────────────────────────────────
     rows = load_claims(claims_path)
+    if args.test > 0:
+        rows = rows[:args.test]
+        console.print(f"  [yellow]--test {args.test}: first {len(rows)} rows[/yellow]")
+
     user_history_dict = load_user_history(history_path)
     requirements_list = load_evidence_requirements(requirements_path)
-    print(f"  {len(rows)} claims | {len(user_history_dict)} users "
-          f"| {len(requirements_list)} requirements")
+    console.print(
+        f"  {len(rows)} claims | {len(user_history_dict)} users "
+        f"| {len(requirements_list)} requirements | [cyan]{args.threads} threads[/cyan]\n"
+    )
 
-    # Each worker gets its own graph instance (MemorySaver, thread-safe)
-    graphs = {p: build_graph() for p in available}
-
+    graph = build_graph()
     configurable = {
         "user_history_dict": user_history_dict,
         "requirements_list": requirements_list,
         "images_base_dir": str(images_base),
     }
 
-    # Build work items: assign provider round-robin by index
-    work = [
-        (idx, row, available[idx % len(available)])
-        for idx, row in enumerate(rows)
-    ]
-
-    # Announce assignment
-    print("\n  Provider assignment:")
-    for p in available:
-        assigned = [idx for idx, _, ap in work if ap == p]
-        print(f"    {p} ({llm._CFG[p]['model']}): "
-              f"{len(assigned)} rows → indices {assigned[:5]}{'…' if len(assigned) > 5 else ''}")
-
-    writer, fh = open_writer(output_path)
-    write_lock = threading.Lock()
-    progress_lock = threading.Lock()
-    results: list[dict] = [None] * len(rows)  # type: ignore[list-item]
+    # ── Run with thread pool ──────────────────────────────────────────────────
+    results: dict[int, dict] = {}
     errors_total = 0
-
-    print(f"\nProcessing {len(rows)} claims with {n_workers} workers …\n")
     t_start = time.time()
+    rows_done_display: list[dict] = []
+    aborted = False
 
-    with tqdm(total=len(rows), desc="Claims", unit="row") as pbar:
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            future_map = {
-                executor.submit(
-                    _process_row,
-                    idx, row, provider,
-                    configurable, graphs[provider],
-                    args.delay, progress_lock, pbar,
-                ): idx
-                for idx, row, provider in work
-            }
+    with Live(console=console, refresh_per_second=4, transient=False) as live:
+        try:
+            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                futures = {
+                    pool.submit(_process_row, idx, row, graph, configurable): idx
+                    for idx, row in enumerate(rows)
+                }
 
-            for future in as_completed(future_map):
-                result = future.result()
-                results[result["idx"]] = result
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        result = future.result()
+                    except SystemExit as exc:
+                        live.stop()
+                        console.print(f"\n[bold red]{exc}[/bold red]")
+                        aborted = True
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    except Exception as exc:
+                        result = {
+                            "_idx": idx,
+                            "_model": llm.active_model(),
+                            "_errors": [str(exc)],
+                            "_user_id": rows[idx]["user_id"],
+                            "claim_status": "not_enough_information",
+                            "severity": "unknown",
+                        }
 
-    # Write output in original row order
-    for r in results:
-        with write_lock:
-            write_row(writer, r["final"])
-        if r["error"]:
-            errors_total += 1
-            print(f"\n  ERROR row {r['idx']} ({rows[r['idx']]['user_id']}): {r['error']}")
+                    results[idx] = result
+                    errors_total += len(result.get("_errors", []))
+
+                    with _table_lock:
+                        rows_done_display.append(result)
+                        rows_done_display.sort(key=lambda r: r["_idx"])
+                        live.update(_build_table(rows_done_display, len(rows)))
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            aborted = True
+
+    if aborted and not results:
+        sys.exit(1)
+
+    # ── Write CSVs in row order ───────────────────────────────────────────────
+    writer,      fh      = open_writer(run_output_path)
+    writer_root, fh_root = open_writer(output_path)
+
+    for idx in sorted(results):
+        r = results[idx]
+        write_row(writer, r)
+        write_row(writer_root, r)
+        write_row_log(idx, r.get("_user_id", "?"), r.get("_model", "?"),
+                      r.get("claim_status", "?"), r.get("_errors", []))
 
     close_writer(writer, fh)
+    close_writer(writer_root, fh_root)
+
+    # ── Copy log.txt into run folder and submission folder ───────────────────
+    src_log = pathlib.Path(log_path())
+    if src_log.exists():
+        shutil.copy2(src_log, run_dir / "log.txt")
+        shutil.copy2(src_log, submission_dir / "log.txt")
 
     elapsed = time.time() - t_start
-    summary = (
-        f"Processed {len(rows)} claims in {elapsed:.1f}s "
-        f"({len(rows)/elapsed:.2f} rows/s) → {output_path}\n"
-        f"Providers used: {available}\n"
-        f"Workers: {n_workers}\n"
-        f"Node-level errors: {errors_total}"
-    )
-    print(f"\n{summary}")
+
+    # ── Run summary ───────────────────────────────────────────────────────────
+    cs_counts = Counter(r.get("claim_status", "?") for r in results.values())
+    usage = llm.get_usage()
+    summary_lines = [
+        f"Mode: {mode}",
+        f"Rows: {len(results)}/{len(rows)}",
+        f"Threads: {args.threads}",
+        f"Elapsed: {elapsed:.1f}s  ({len(results)/max(elapsed, 1):.2f} rows/s)",
+        f"Model: {llm.active_model()}",
+        f"claim_status: {dict(cs_counts)}",
+        f"LLM calls: {usage.get('calls', 0)}  "
+        f"(in {usage.get('prompt_tokens', 0):,} tok / out {usage.get('completion_tokens', 0):,} tok)",
+        f"Node-level errors: {errors_total}",
+        f"Run dir: {run_dir}",
+        f"Output: {run_output_path}",
+    ]
+    summary = "\n".join(summary_lines)
+    (run_dir / "run_summary.txt").write_text(summary + "\n", encoding="utf-8")
+
+    console.print(f"\n[bold green]Done![/bold green]")
+    for line in summary_lines:
+        console.print(f"  {line}")
 
     if errors_total:
-        print(f"\nWARNING: {errors_total} rows had errors — inspect output.csv before submitting.")
+        console.print(
+            f"\n[yellow]WARNING: {errors_total} node-level errors — "
+            "inspect run_summary.txt before submitting.[/yellow]"
+        )
 
-    from code.utils.logger import log_path
-    print("\n" + "=" * 64)
-    print("  RESULTS SAVED")
-    print(f"  Output (submit this): {output_path}")
-    print(f"  Log file:             {log_path()}")
-    print("=" * 64 + "\n")
+    console.print(f"\n  Output (run)        → [cyan]{run_output_path}[/cyan]")
+    console.print(f"  Output (submission) → [cyan]{output_path}[/cyan]")
+    console.print(f"  Log (submission)    → [cyan]{submission_dir / 'log.txt'}[/cyan]")
+    console.print(f"  Log (global)        → [cyan]{src_log}[/cyan]\n")
 
     write_turn(
-        title="Run inference on claims.csv (multi-threaded)",
-        user_prompt="python code/main.py",
+        title=f"Run inference ({mode})",
+        user_prompt=f"python code/main.py --test {args.test}" if args.test else "python code/main.py",
         summary=summary,
         actions=[
             f"Read {claims_path}",
+            f"Wrote {run_output_path}",
             f"Wrote {output_path}",
-            f"Providers: {available}",
-            f"Workers: {n_workers}",
-            f"Log: {log_path()}",
+            f"Copied log → {run_dir / 'log.txt'}",
         ],
     )
 

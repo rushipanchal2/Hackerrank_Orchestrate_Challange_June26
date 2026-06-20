@@ -119,13 +119,13 @@ def write_session_start() -> None:
     )
 
 
-def write_row_log(idx: int, user_id: str, provider: str, model: str,
+def write_row_log(idx: int, user_id: str, model: str,
                   status: str, errors: list[str]) -> None:
     """Log a single processed row in real time (called immediately after each row)."""
     err_str = "; ".join(errors) if errors else "none"
     _append(
         f"## [{_now()}] ROW {idx:04d} — {user_id}\n\n"
-        f"Provider: {provider} ({model})\n"
+        f"Model: {model}\n"
         f"Status: {status}\n"
         f"Errors: {err_str}"
     )

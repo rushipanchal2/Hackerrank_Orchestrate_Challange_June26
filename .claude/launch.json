@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "test (5 rows)",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["code/main.py", "--test", "5", "--skip-onboarding"],
+      "port": 0
+    },
+    {
+      "name": "run-full (all 44 claims)",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["code/main.py", "--skip-onboarding"],
+      "port": 0
+    },
+    {
+      "name": "eval (LangGraph strategy)",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["code/evaluation/main.py", "--strategy", "langgraph"],
+      "port": 0
+    },
+    {
+      "name": "eval-A (single_shot strategy)",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["code/evaluation/main.py", "--strategy", "single_shot"],
+      "port": 0
+    }
+  ]
+}

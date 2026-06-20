@@ -1,43 +1,58 @@
 PYTHON := .venv/bin/python3
 
-.PHONY: eval eval-both eval-A eval-test install clean submit run run-fresh
+.PHONY: eval eval-A eval-both test test10 run run-full run-sample install clean submit
 
-# Strategy B (LangGraph) on labeled sample — default eval target
+# ── Default dev run: 5 rows, 2 threads ───────────────────────────────────────
+test:
+	$(PYTHON) code/main.py --test 5 --threads 2 --skip-onboarding
+
+test10:
+	$(PYTHON) code/main.py --test 10 --threads 2 --skip-onboarding
+
+# ── Default run = 5 samples (safe for dev/iteration) ─────────────────────────
+run:
+	$(PYTHON) code/main.py --test 5 --threads 2 --skip-onboarding
+
+# ── Full inference run on all 44 claims → output/ + output.csv ───────────────
+run-full:
+	$(PYTHON) code/main.py --threads 2 --skip-onboarding
+
+# ── Run on sample_claims.csv (for manual inspection, 5 rows) ─────────────────
+run-sample:
+	$(PYTHON) code/main.py --sample --test 5 --threads 2 --skip-onboarding
+
+# ── Evaluation (Strategy B LangGraph) on sample_claims.csv ───────────────────
 eval:
-	$(PYTHON) code/evaluate.py --strategy B --dataset sample
+	$(PYTHON) code/evaluation/main.py --strategy langgraph
 
-# Strategy A (single-shot) on labeled sample
+# ── Evaluation (Strategy A single-shot) on sample_claims.csv ─────────────────
 eval-A:
-	$(PYTHON) code/evaluate.py --strategy A --dataset sample
+	$(PYTHON) code/evaluation/main.py --strategy single_shot
 
-# Both strategies on labeled sample → results/comparison.md
-eval-both:
-	$(PYTHON) code/evaluate.py --strategy both --dataset sample
+# ── Both strategies ───────────────────────────────────────────────────────────
+eval-both: eval eval-A
 
-# Strategy B on full test set → output.csv (no scoring, no ground truth)
-eval-test:
-	$(PYTHON) code/evaluate.py --strategy B --dataset test
-
-# Install dependencies into .venv
+# ── Install dependencies into .venv ──────────────────────────────────────────
 install:
 	python3 -m venv .venv
 	.venv/bin/pip install -r code/requirements.txt -q
 
-# Run main inference on claims.csv (production submission)
-run:
-	$(PYTHON) code/main.py --skip-onboarding
-
-run-fresh:
-	$(PYTHON) code/main.py --fresh --skip-onboarding
-
-# Remove generated/temp files (checkpoints, caches, results) — keeps output.csv
+# ── Remove generated/temp files ───────────────────────────────────────────────
 clean:
-	rm -f checkpoints.db
-	rm -rf results
+	rm -f checkpoints.db checkpoints.db-shm checkpoints.db-wal
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	find . -type f -name '*.pyc' -delete
 	find . -type f -name '.DS_Store' -delete
-	@echo "Cleaned: checkpoints.db, results/, __pycache__, *.pyc, .DS_Store"
+	@echo "Cleaned: checkpoints, __pycache__, *.pyc"
 
-# Full clean + fresh production run → prints the file to submit
-submit: clean run-fresh
+# ── Wipe all timestamped output runs (keeps root output.csv) ──────────────────
+clean-output:
+	rm -rf output/
+	@echo "Cleaned: output/ runs"
+
+# ── Full submission pipeline: clean → run → verify ───────────────────────────
+submit: clean run-full
+	@echo ""
+	@echo "Submit these files to HackerRank:"
+	@echo "  1. submission/output.csv"
+	@echo "  2. code.zip (zip -r code.zip code/ dataset/ *.md Makefile .env.example)"

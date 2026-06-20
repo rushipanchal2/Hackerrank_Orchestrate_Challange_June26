@@ -1,305 +1,306 @@
-"""Provider-agnostic LLM client for the claim pipeline.
+"""LiteLLM-backed LLM client with cooldown-based routing and dual-key Groq support.
 
-Pick the provider with the LLM_PROVIDER env var:
+Model priority (free tier only):
+  GROUP gemini  — gemini/gemini-2.5-flash          (vision, GEMINI_API_KEY)
+                  gemini/gemini-2.5-flash-lite      (vision, GEMINI_API_KEY, lighter quota)
+  GROUP groq1   — llama-4-scout (vision)            (GROQ_API_KEY)
+                  llama-3.3-70b (text-only)
+                  llama-3.1-8b  (text-only)
+  GROUP groq2   — same models, GROQ_API_KEY_2       (separate TPM bucket = 2× effective TPM)
 
-    auto       (default) ping providers in order and use the first that responds
-    gemini     Google Gemini   (free tier, vision)   — GEMINI_API_KEY
-    groq       Groq Llama-4    (free tier, vision)   — GROQ_API_KEY
-    anthropic  Anthropic Claude (paid API, vision)   — ANTHROPIC_API_KEY
-
-Multi-threading: each thread can be assigned a specific provider via the
-`provider` parameter on text_call()/vision_call(). When `provider=None` the
-globally selected provider is used. If a call fails, automatic fallback tries
-the next available provider and logs the switch to terminal + log file.
-
-Optional model overrides: GEMINI_MODEL, GROQ_MODEL, ANTHROPIC_MODEL.
+Routing:
+  - Each entry has a unique cooldown key (group:model) so groq1 and groq2
+    rate limits are tracked independently.
+  - Available models (cooldown expired) are always tried before cooling ones.
+  - api_key is passed explicitly per call — LiteLLM env vars are not relied on.
+  - On 429: set per-entry cooldown from retry-after, move to next available entry.
+  - If all entries cooling: wait for soonest, retry up to 3×.
+  - Thread-local last_model: 2 parallel threads track their own last-used model.
 """
 
 import os
+import re
 import threading
+import time
 
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+import litellm
+from litellm import completion, RateLimitError, BadRequestError, AuthenticationError
 
-_AUTO_ORDER = ["gemini", "groq", "anthropic"]
+litellm.set_verbose = False
+litellm.suppress_debug_info = True
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+import logging
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("litellm").setLevel(logging.ERROR)
 
-_CFG = {
-    "gemini": {
-        "key": "GEMINI_API_KEY",
-        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "kind": "openai",
-    },
-    "groq": {
-        "key": "GROQ_API_KEY",
-        "model": os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
-        "base_url": "https://api.groq.com/openai/v1",
-        "kind": "openai",
-    },
-    "anthropic": {
-        "key": "ANTHROPIC_API_KEY",
-        "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        "base_url": None,
-        "kind": "anthropic",
-    },
-}
+# ── Model registry ────────────────────────────────────────────────────────────
 
-_clients: dict = {}
-_clients_lock = threading.Lock()
-_active: str | None = None
-_available: list[str] = []   # providers that passed ping, in order
+def _build_model_list() -> list[dict]:
+    gemini_key  = os.getenv("GEMINI_API_KEY", "").strip()
+    groq_key1   = os.getenv("GROQ_API_KEY", "").strip()
+    groq_key2   = os.getenv("GROQ_API_KEY_2", "").strip()
 
+    entries = []
 
-def _has_key(provider: str) -> bool:
-    return bool(os.getenv(_CFG[provider]["key"], "").strip())
-
-
-def _client(provider: str):
-    with _clients_lock:
-        if provider not in _clients:
-            cfg = _CFG[provider]
-            if cfg["kind"] == "openai":
-                from openai import OpenAI
-                _clients[provider] = OpenAI(
-                    api_key=os.getenv(cfg["key"]), base_url=cfg["base_url"]
-                )
-            else:
-                import anthropic
-                _clients[provider] = anthropic.Anthropic(
-                    api_key=os.getenv(cfg["key"])
-                )
-        return _clients[provider]
-
-
-def _retryable_excs() -> tuple:
-    excs: list = []
-    try:
-        import openai
-        excs += [
-            openai.RateLimitError,
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-            openai.InternalServerError,
+    if gemini_key:
+        entries += [
+            {"group": "gemini", "vision": True,
+             "model": "gemini/gemini-2.5-flash",      "api_key": gemini_key},
+            {"group": "gemini", "vision": True,
+             "model": "gemini/gemini-2.5-flash-lite",  "api_key": gemini_key},
         ]
+    if groq_key1:
+        entries += [
+            {"group": "groq1", "vision": True,
+             "model": "groq/meta-llama/llama-4-scout-17b-16e-instruct", "api_key": groq_key1},
+            {"group": "groq1", "vision": False,
+             "model": "groq/llama-3.3-70b-versatile",  "api_key": groq_key1},
+            {"group": "groq1", "vision": False,
+             "model": "groq/llama-3.1-8b-instant",     "api_key": groq_key1},
+        ]
+    if groq_key2:
+        entries += [
+            {"group": "groq2", "vision": True,
+             "model": "groq/meta-llama/llama-4-scout-17b-16e-instruct", "api_key": groq_key2},
+            {"group": "groq2", "vision": False,
+             "model": "groq/llama-3.3-70b-versatile",  "api_key": groq_key2},
+            {"group": "groq2", "vision": False,
+             "model": "groq/llama-3.1-8b-instant",     "api_key": groq_key2},
+        ]
+    return entries
+
+
+_ACTIVE_MODELS: list[dict] = _build_model_list()
+
+# ── Per-entry unique key (group:model) for independent cooldown tracking ──────
+
+def _entry_key(entry: dict) -> str:
+    return f"{entry['group']}:{entry['model']}"
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+_lock = threading.Lock()
+_cooldowns: dict[str, float] = {}   # entry_key → time.time() when available
+_warned:    set[str]         = set() # suppress repeated WARN lines per entry
+_thread_local = threading.local()   # per-thread last_model
+
+# ── Token usage accounting (real numbers for the operational report) ──────────
+_usage_lock = threading.Lock()
+_usage = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+
+
+def _add_usage(resp) -> None:
+    """Accumulate real prompt/completion token counts from a LiteLLM response."""
+    try:
+        u = resp.usage
+        pt = getattr(u, "prompt_tokens", 0) or 0
+        ct = getattr(u, "completion_tokens", 0) or 0
+    except Exception:
+        return
+    with _usage_lock:
+        _usage["prompt_tokens"] += pt
+        _usage["completion_tokens"] += ct
+        _usage["calls"] += 1
+
+
+def get_usage() -> dict:
+    """Return a snapshot of accumulated token usage since the last reset."""
+    with _usage_lock:
+        return dict(_usage)
+
+
+def reset_usage() -> None:
+    with _usage_lock:
+        _usage.update(prompt_tokens=0, completion_tokens=0, calls=0)
+
+
+def _set_cooldown(entry: dict, err_str: str) -> None:
+    waits = re.findall(r"try again in (\d+(?:\.\d+)?)\s*s", err_str.lower())
+    wait = max((float(w) for w in waits), default=15) + 2
+    with _lock:
+        _cooldowns[_entry_key(entry)] = time.time() + wait
+
+
+def _is_available(entry: dict) -> bool:
+    return time.time() >= _cooldowns.get(_entry_key(entry), 0)
+
+
+def _sorted_entries() -> list[dict]:
+    """Available entries first, then sorted by soonest cooldown."""
+    now = time.time()
+    avail   = [e for e in _ACTIVE_MODELS if _cooldowns.get(_entry_key(e), 0) <= now]
+    cooling = sorted(
+        [e for e in _ACTIVE_MODELS if _cooldowns.get(_entry_key(e), 0) > now],
+        key=lambda e: _cooldowns.get(_entry_key(e), 0),
+    )
+    return avail + cooling
+
+
+def _soonest_wait() -> float:
+    now = time.time()
+    waits = [max(_cooldowns.get(_entry_key(e), 0) - now, 0) for e in _ACTIVE_MODELS]
+    return min(waits) if waits else 0
+
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+
+def startup_banner() -> None:
+    if not _ACTIVE_MODELS:
+        raise SystemExit(
+            "No LLM API keys found.\n"
+            "Set GEMINI_API_KEY and/or GROQ_API_KEY in .env\n"
+            "Optional: GROQ_API_KEY_2 for a second Groq TPM bucket."
+        )
+    print("\n  [MODELS] Priority order:", flush=True)
+    for i, e in enumerate(_ACTIVE_MODELS):
+        label = "PRIMARY" if i == 0 else f"FALLBACK-{i}"
+        key_hint = f"[{e['group']}]"
+        vis = "vision" if e["vision"] else "text"
+        print(f"    {i+1}. {e['model']}  {key_hint}  [{label}]  ({vis})", flush=True)
+    print(flush=True)
+
+
+def _announce(msg: str) -> None:
+    print(msg, flush=True)
+    try:
+        from code.utils.logger import _append
+        _append(f"## [MODEL EVENT]\n\n{msg}")
     except Exception:
         pass
-    try:
-        import anthropic
-        excs += [
-            anthropic.RateLimitError,
-            anthropic.APIConnectionError,
-            anthropic.APITimeoutError,
-            anthropic.InternalServerError,
+
+
+# ── Message builder ───────────────────────────────────────────────────────────
+
+def _build_messages(system: str, text: str,
+                    images: list | None, vision: bool) -> list[dict]:
+    if not vision or not images:
+        return [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": text},
         ]
-    except Exception:
-        pass
-    return tuple(excs) or (Exception,)
-
-
-# ── content builders ──────────────────────────────────────────────────────────
-
-def _openai_user_content(text: str, images: list | None) -> list:
-    parts: list = []
-    for img in images or []:
+    content: list = []
+    for img in images:
         if img.get("exists") and img.get("base64_str"):
-            parts.append({
+            content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{img['base64_str']}"},
             })
-            parts.append({"type": "text", "text": f"[Image ID: {img['image_id']}]"})
-    parts.append({"type": "text", "text": text})
-    return parts
-
-
-def _anthropic_content(text: str, images: list | None) -> list:
-    content: list = []
-    for img in images or []:
-        if img.get("exists") and img.get("base64_str"):
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": img["base64_str"],
-                },
-            })
             content.append({"type": "text", "text": f"[Image ID: {img['image_id']}]"})
     content.append({"type": "text", "text": text})
-    return content
+    return [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": content},
+    ]
 
 
-# ── core call (with transient-only retry) ─────────────────────────────────────
+# ── Core call ─────────────────────────────────────────────────────────────────
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    retry=retry_if_exception_type(_retryable_excs()),
-    reraise=True,
-)
-def _call_once(provider: str, system: str, text: str, images: list | None,
-               max_tokens: int, json_mode: bool) -> str:
-    cfg = _CFG[provider]
-    if cfg["kind"] == "openai":
-        kwargs: dict = {}
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = _client(provider).chat.completions.create(
-            model=cfg["model"],
-            temperature=0,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": _openai_user_content(text, images)},
-            ],
-            **kwargs,
-        )
-        return resp.choices[0].message.content or ""
-    # anthropic
-    resp = _client(provider).messages.create(
-        model=cfg["model"],
-        max_tokens=max_tokens,
-        temperature=0,
-        system=system,
-        messages=[{"role": "user", "content": _anthropic_content(text, images)}],
-    )
-    return resp.content[0].text
-
-
-def _call_with_fallback(preferred: str, system: str, text: str, images: list | None,
-                        max_tokens: int, json_mode: bool) -> str:
-    """Try preferred provider first, then fall back through available providers."""
-    candidates = [preferred] + [p for p in _available if p != preferred]
+def _call(system: str, text: str, images: list | None,
+          max_tokens: int) -> tuple[str, str]:
+    """Call LiteLLM with cooldown-aware fallback. Returns (response_text, model_label)."""
+    has_images = bool(images)
     last_exc: Exception | None = None
-    for provider in candidates:
-        try:
-            result = _call_once(provider, system, text, images, max_tokens, json_mode)
-            if provider != preferred:
-                # Switched provider mid-run — announce it
-                model = _CFG[provider]["model"]
-                msg = (f"  [PROVIDER SWITCH] {preferred} → {provider} "
-                       f"({model}) — {type(last_exc).__name__}: {str(last_exc)[:80]}")
-                print(msg, flush=True)
-                try:
-                    from code.utils.logger import write_provider_switch
-                    write_provider_switch(
-                        from_provider=preferred,
-                        to_provider=provider,
-                        reason=f"{type(last_exc).__name__}: {str(last_exc)[:140]}",
-                        model=model,
-                    )
-                except Exception:
-                    pass
-            return result
-        except Exception as exc:
-            last_exc = exc
-            print(f"  [WARN] {provider} failed: {type(exc).__name__}: {str(exc)[:80]}",
-                  flush=True)
-    raise RuntimeError(
-        f"All providers failed. Last error from {candidates[-1]}: {last_exc}"
+    prev_model: str = getattr(_thread_local, "last_model", "")
+
+    for attempt in range(4):
+        ordered = _sorted_entries()
+
+        if all(not _is_available(e) for e in ordered):
+            if attempt >= 3:
+                break
+            wait = _soonest_wait()
+            print(f"  [WAIT] All models cooling. Retrying in {wait:.0f}s "
+                  f"(attempt {attempt+1}/3) …", flush=True)
+            time.sleep(max(wait, 1) + 1)
+            continue
+
+        for entry in ordered:
+            if not _is_available(entry):
+                continue
+
+            model       = entry["model"]
+            api_key     = entry["api_key"]
+            is_vision   = entry["vision"]
+            use_vision  = has_images and is_vision
+            ekey        = _entry_key(entry)
+
+            messages = _build_messages(
+                system, text,
+                images if use_vision else None,
+                vision=use_vision,
+            )
+
+            try:
+                resp = completion(
+                    model=model,
+                    api_key=api_key,        # explicit per-entry key
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=0,
+                    timeout=60,
+                )
+                result = resp.choices[0].message.content or ""
+                _add_usage(resp)
+
+                label = f"{model} [{entry['group']}]"
+                if prev_model and prev_model != label:
+                    suffix = " (text-only)" if has_images and not is_vision else ""
+                    _announce(f"  [MODEL SWITCH] {prev_model} → {label}{suffix}")
+                elif not prev_model:
+                    print(f"  [MODEL] Using: {label}", flush=True)
+
+                with _lock:
+                    _warned.discard(ekey)
+                _thread_local.last_model = label
+                return result, label
+
+            except (RateLimitError, BadRequestError, AuthenticationError) as exc:
+                last_exc = exc
+                _set_cooldown(entry, str(exc))
+                if ekey not in _warned:
+                    short = str(exc)[:120].replace("\n", " ")
+                    print(f"  [WARN] {model} [{entry['group']}]: {short}", flush=True)
+                    with _lock:
+                        _warned.add(ekey)
+                continue
+
+            except Exception as exc:
+                last_exc = exc
+                print(f"  [ERR] {model}: {str(exc)[:120]}", flush=True)
+                continue
+
+        # All available entries tried; loop will wait and retry
+        if attempt < 3:
+            wait = _soonest_wait()
+            print(f"  [WAIT] All models cooling. Retrying in {max(wait,1):.0f}s "
+                  f"(attempt {attempt+1}/3) …", flush=True)
+            time.sleep(max(wait, 1) + 1)
+
+    raise SystemExit(
+        f"All models limit exhausted after retries. Last error: {last_exc}\n"
+        "Keys tried: GEMINI_API_KEY, GROQ_API_KEY" +
+        (", GROQ_API_KEY_2" if os.getenv("GROQ_API_KEY_2") else " (tip: add GROQ_API_KEY_2 for 2× TPM)") + "\n"
+        "Please wait for rate limit reset or add API credits."
     )
 
 
-# ── provider selection ────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────
 
-def _ping(provider: str) -> None:
-    cfg = _CFG[provider]
-    if cfg["kind"] == "openai":
-        _client(provider).chat.completions.create(
-            model=cfg["model"], max_tokens=4,
-            messages=[{"role": "user", "content": "ping"}],
-        )
-    else:
-        _client(provider).messages.create(
-            model=cfg["model"], max_tokens=4,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+def text_call(system: str, user: str, max_tokens: int = 512, **_kw) -> str:
+    text, _ = _call(system, user, None, max_tokens)
+    return text
 
 
-def select_provider(verbose: bool = True) -> str:
-    """Resolve and cache the active provider. Raises SystemExit if none work."""
-    global _active, _available
-    if _active:
-        return _active
-
-    requested = os.getenv("LLM_PROVIDER", "auto").strip().lower()
-
-    if requested and requested != "auto":
-        if requested not in _CFG:
-            raise SystemExit(f"Unknown LLM_PROVIDER={requested!r} "
-                             f"(use one of: auto, {', '.join(_CFG)})")
-        if not _has_key(requested):
-            raise SystemExit(f"LLM_PROVIDER={requested} but {_CFG[requested]['key']} "
-                             f"is not set in .env")
-        _active = requested
-        _available = [requested]
-        if verbose:
-            model = _CFG[requested]["model"]
-            print(f"  [MODEL] {requested} → {model}", flush=True)
-        return _active
-
-    # auto: try each provider that has a key, in order
-    errors: list[str] = []
-    working: list[str] = []
-    for p in _AUTO_ORDER:
-        if not _has_key(p):
-            continue
-        try:
-            _ping(p)
-            working.append(p)
-            if verbose:
-                model = _CFG[p]["model"]
-                label = "PRIMARY" if not working or len(working) == 1 else "FALLBACK"
-                print(f"  [MODEL] {p} ({model}) — {label}", flush=True)
-        except Exception as e:
-            errors.append(f"{p}: {type(e).__name__}: {str(e)[:140]}")
-            if verbose:
-                print(f"  [MODEL] {p} — UNAVAILABLE ({type(e).__name__})", flush=True)
-
-    if not working:
-        if errors:
-            raise SystemExit("No working LLM provider. Tried:\n  " + "\n  ".join(errors))
-        raise SystemExit("No LLM API keys found — set GEMINI_API_KEY, GROQ_API_KEY, "
-                         "or ANTHROPIC_API_KEY in .env")
-
-    _active = working[0]
-    _available = working
-
-    if verbose and len(working) > 1:
-        print(f"  [MODEL] Active provider: {_active} | Fallbacks: {working[1:]}",
-              flush=True)
-    elif verbose:
-        print(f"  [MODEL] Active provider: {_active} (no fallbacks available)",
-              flush=True)
-
-    return _active
-
-
-def active() -> str:
-    return _active or select_provider(verbose=False)
+def vision_call(system: str, images: list, text: str,
+                max_tokens: int = 768, **_kw) -> str:
+    result, _ = _call(system, text, images, max_tokens)
+    return result
 
 
 def active_model() -> str:
-    return _CFG[active()]["model"]
+    return getattr(_thread_local, "last_model",
+                   _ACTIVE_MODELS[0]["model"] if _ACTIVE_MODELS else "unknown")
 
 
 def get_available_providers() -> list[str]:
-    """Return all working providers discovered during select_provider()."""
-    return list(_available)
-
-
-# ── public API used by strategies/nodes ───────────────────────────────────────
-
-def text_call(system: str, user: str, max_tokens: int = 1024,
-              json_mode: bool = True, provider: str | None = None) -> str:
-    p = provider or active()
-    return _call_with_fallback(p, system, user, None, max_tokens, json_mode)
-
-
-def vision_call(system: str, images: list, text: str, max_tokens: int = 2048,
-                json_mode: bool = True, provider: str | None = None) -> str:
-    p = provider or active()
-    return _call_with_fallback(p, system, text, images, max_tokens, json_mode)
+    return [e["model"] for e in _ACTIVE_MODELS]

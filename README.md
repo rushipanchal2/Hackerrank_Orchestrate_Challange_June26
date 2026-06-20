@@ -1,10 +1,6 @@
-# HackerRank Orchestrate
+# HackerRank Orchestrate — Multi-Modal Evidence Review
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon.
-
-Build a system that verifies visual evidence for damage claims across three object types: **cars**, **laptops**, and **packages**.
-
-Your system will receive claim conversations, one or more submitted images, user claim history, and minimum evidence requirements. It must decide whether the submitted images support the claim, contradict it, or do not provide enough information.
+LangGraph pipeline that verifies damage claims (car / laptop / package) using submitted images, a multilingual chat transcript, user claim history, and minimum evidence requirements.
 
 Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, and allowed values.
 
@@ -13,13 +9,13 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 ## Contents
 
 1. [Repository layout](#repository-layout)
-2. [What you need to build](#what-you-need-to-build)
-3. [Where your code goes](#where-your-code-goes)
-4. [Quickstart](#quickstart)
-5. [Evaluation](#evaluation)
-6. [Chat transcript logging](#chat-transcript-logging)
-7. [Submission](#submission)
-8. [Judge interview](#judge-interview)
+2. [Setup](#setup)
+3. [Running the pipeline](#running-the-pipeline)
+4. [Evaluation](#evaluation)
+5. [Architecture](#architecture)
+6. [Output schema](#output-schema)
+7. [Chat transcript logging](#chat-transcript-logging)
+8. [Submission](#submission)
 
 ---
 
@@ -30,13 +26,38 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 ├── AGENTS.md                         # Rules for AI coding tools + transcript logging
 ├── problem_statement.md              # Full task description and I/O schema
 ├── README.md                         # You are here
-├── code/                             # Build your solution here
-│   ├── main.py                       # Suggested terminal entry point
+├── Makefile                          # Common commands (see below)
+├── output.csv                        # Final predictions (generated, root copy)
+├── output/                           # Per-run timestamped folders
+│   └── run_YYYYMMDD_HHMMSS_MODE/
+│       ├── output.csv                # Predictions for this run
+│       ├── log.txt                   # Snapshot of the session log
+│       └── run_summary.txt           # Row counts, model used, timings
+├── code/
+│   ├── main.py                       # CLI entry point
+│   ├── requirements.txt
+│   ├── graph/
+│   │   ├── state.py                  # ClaimState TypedDict
+│   │   ├── nodes.py                  # LangGraph node functions
+│   │   └── graph.py                  # Graph wiring + MemorySaver
+│   ├── prompts/
+│   │   ├── extract_claim.py
+│   │   ├── analyze_images.py
+│   │   └── synthesize_decision.py
+│   ├── utils/
+│   │   ├── llm.py                    # LiteLLM-backed client with auto-fallback
+│   │   ├── schema.py                 # Allowed values + validate_row()
+│   │   ├── logger.py                 # AGENTS.md log file + onboarding gate
+│   │   ├── csv_reader.py             # Load claims, history, requirements
+│   │   ├── image_loader.py           # Encode images as base64
+│   │   └── output_writer.py          # Write output.csv
+│   ├── strategies/
+│   │   └── single_shot.py            # Strategy A baseline (1 LLM call/row)
 │   └── evaluation/
-│       └── main.py                   # Suggested evaluation entry point
+│       └── main.py                   # Eval harness — scores against sample_claims.csv
 └── dataset/
     ├── sample_claims.csv             # Inputs + expected outputs for development
-    ├── claims.csv                    # Inputs only; run your system on these rows
+    ├── claims.csv                    # Inputs only; run your system on these
     ├── user_history.csv              # Historical claim counts and risk context
     ├── evidence_requirements.csv     # Minimum image evidence requirements
     └── images/
@@ -46,116 +67,172 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 
 ---
 
-## What you need to build
-
-A system that, for each row in `dataset/claims.csv`, produces one row in `output.csv`.
-
-Input fields:
-
-| Column | Meaning |
-|---|---|
-| `user_id` | User submitting the claim; use this to look up `dataset/user_history.csv` |
-| `image_paths` | One or more submitted image paths, separated by semicolons |
-| `user_claim` | Chat transcript describing the issue |
-| `claim_object` | `car`, `laptop`, or `package` |
-
-Required output fields:
-
-| Column | Meaning |
-|---|---|
-| `evidence_standard_met` | Whether the image set is sufficient to evaluate the claim |
-| `evidence_standard_met_reason` | Short reason for the evidence decision |
-| `risk_flags` | Semicolon-separated risk flags, or `none` |
-| `issue_type` | Visible issue type |
-| `object_part` | Relevant object part |
-| `claim_status` | `supported`, `contradicted`, or `not_enough_information` |
-| `claim_status_justification` | Concise explanation grounded in the image evidence |
-| `supporting_image_ids` | Image IDs supporting the decision, or `none` |
-| `valid_image` | Whether the image set is usable for automated review |
-| `severity` | `none`, `low`, `medium`, `high`, or `unknown` |
-
-Hard requirements:
-
-- Must read the provided CSV files and local images.
-- Must produce `output.csv` with the exact schema in `problem_statement.md`.
-- Must include an evaluation workflow
-- Must avoid hardcoded test labels or file-specific answers.
-
-Beyond that you are free to bring your own approach: VLMs, LLMs, structured prompting, rule layers, batching, caching, evaluation pipelines, model comparison, or anything else.
-
----
-
-## Where your code goes
-
-All of your work belongs in [`code/`](./code/). The repo ships with empty starter files that you can grow into your full solution.
-
-Suggested conventions:
-
-- Put your main runnable solution in `code/main.py`, or document your own entry point clearly.
-- Put evaluation code under `code/evaluation/` or an `evaluation/` folder included in your final `code.zip`.
-- Write final predictions to `output.csv`.
-
----
-
-## Quickstart
-
-Clone this repository:
+## Setup
 
 ```bash
-git clone git@github.com:interviewstreet/hackerrank-orchestrate-june26.git
-cd hackerrank-orchestrate-june26
+# 1. Create virtualenv
+python3 -m venv .venv
+source .venv/bin/activate       # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r code/requirements.txt
+
+# 3. Add API keys to .env at repo root
+cat > .env <<'EOF'
+GEMINI_API_KEY=AIza...          # free tier + vision — aistudio.google.com
+GROQ_API_KEY=gsk_...            # free tier + vision — console.groq.com
+EOF
 ```
 
-You are free to use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
+Only one key is required. The pipeline tries models in priority order and falls back automatically.
+
+---
+
+## Running the pipeline
+
+### Make commands (recommended)
+
+| Command | What it does |
+|---|---|
+| `make run` | Process **5 rows** (safe default for dev / API quota) |
+| `make test` | Same as `make run` — 5 rows |
+| `make test10` | Process 10 rows |
+| `make run-full` | Process all 44 claims → `output.csv` |
+| `make run-sample` | Run on `sample_claims.csv` (5 rows) |
+| `make eval` | Score LangGraph strategy against `sample_claims.csv` |
+| `make eval-A` | Score single-shot baseline against `sample_claims.csv` |
+| `make eval-both` | Run both eval strategies |
+| `make submit` | clean → run-full → print submission checklist |
+| `make install` | Set up `.venv` and install dependencies |
+| `make clean` | Remove `__pycache__`, `.pyc`, checkpoint DB files |
+
+> **Default `make run` processes only 5 rows** to avoid burning API quota during iteration. Use `make run-full` for the final submission run.
+
+### Direct CLI
+
+```bash
+# 5-row dev test
+python code/main.py --test 5 --skip-onboarding
+
+# Full run
+python code/main.py --skip-onboarding
+
+# On sample_claims.csv
+python code/main.py --sample --skip-onboarding
+```
+
+### Output
+
+Each run writes to:
+- `output/run_YYYYMMDD_HHMMSS_<mode>/output.csv` — timestamped per-run copy
+- `output/run_.../log.txt` — snapshot of the session log at end of run
+- `output/run_.../run_summary.txt` — row counts, model used, timings
+- `output.csv` (root) — always overwritten with latest run (submit this)
+
+---
+
+## LLM model routing
+
+The pipeline uses [LiteLLM](https://github.com/BerriAI/litellm) with **cooldown-based routing** — each model tracks a per-model cooldown from the API's `retry-after` header. Available models (not in cooldown) are always tried first.
+
+| Group | Model | Vision | Key |
+|---|---|---|---|
+| Gemini | `gemini/gemini-2.5-flash` | Yes | `GEMINI_API_KEY` |
+| Groq | `groq/meta-llama/llama-4-scout-17b-16e-instruct` | Yes | `GROQ_API_KEY` |
+| Groq | `groq/llama-3.3-70b-versatile` | No (text-only) | `GROQ_API_KEY` |
+| Groq | `groq/llama-3.1-8b-instant` | No (text-only) | `GROQ_API_KEY` |
+
+- **Per-model cooldown**: on 429, sets a cooldown from `retry-after`; model is skipped until ready
+- **Availability-first ordering**: models off cooldown are tried before cooling models (no fixed retry order)
+- **Cross-service fallback**: if Gemini group is exhausted, Groq group takes over automatically
+- **Wait-and-retry**: if all models cooling simultaneously, waits for soonest and retries up to 3×
+- **2 parallel threads**: rows processed concurrently via `ThreadPoolExecutor`; thread-safe per-thread model tracking
+- **Image compression**: images resized to 768px and JPEG-compressed at quality 72 before encoding (~75% smaller payloads)
 
 ---
 
 ## Evaluation
 
-The evaluation report should include:
+```bash
+make eval        # LangGraph multi-step strategy (Strategy B)
+make eval-A      # Single-shot baseline (Strategy A)
+make eval-both   # Both + comparison
+```
 
-- metrics on `dataset/sample_claims.csv`
-- at least two strategies, prompts, or model configurations compared
-- the final strategy used for `output.csv`
-- operational analysis covering model calls, token usage, image usage, approximate cost, runtime, and TPM/RPM considerations
+Results are written to `results/run_TIMESTAMP_eval/` and include:
+- Per-row ✓/✗ accuracy
+- `evaluation/evaluation_report.md` (required by problem statement)
+- `evaluation/metrics.json`
+
+---
+
+## Architecture
+
+Three LLM calls per claim, five graph nodes total:
+
+| Node | Type | Purpose |
+|---|---|---|
+| `load_context` | Python | Load user history, evidence requirements, encode images as base64 |
+| `extract_claim` | LLM text | Normalise multilingual conversation → structured English claim |
+| `analyze_images` | LLM vision | Per-image quality, content, and injection detection |
+| `synthesize_decision` | LLM text | Final structured verdict with justification |
+| `format_output` | Python | Validate all fields against allowed-value schema |
+
+Checkpointing: `MemorySaver` (in-memory, no SQLite WAL files).
+
+---
+
+## Output schema
+
+`output.csv` must contain exactly these 14 columns in order:
+
+| Column | Allowed values |
+|---|---|
+| `user_id` | string |
+| `image_paths` | semicolon-separated paths |
+| `user_claim` | string |
+| `claim_object` | `car`, `laptop`, `package` |
+| `evidence_standard_met` | `true` / `false` |
+| `evidence_standard_met_reason` | string |
+| `risk_flags` | semicolon-separated flags, or `none` |
+| `issue_type` | string |
+| `object_part` | string |
+| `claim_status` | `supported`, `contradicted`, `not_enough_information` |
+| `claim_status_justification` | string |
+| `supporting_image_ids` | semicolon-separated IDs, or `none` |
+| `valid_image` | `true` / `false` |
+| `severity` | `none`, `low`, `medium`, `high`, `unknown` |
 
 ---
 
 ## Chat transcript logging
 
-This repo ships with an `AGENTS.md` that modern AI coding tools may read. It instructs the tool to append conversation turns to a shared log file:
+Per `AGENTS.md`, every AI coding session appends entries to:
 
 | Platform | Path |
 |---|---|
 | macOS / Linux | `$HOME/hackerrank_orchestrate/log.txt` |
 | Windows | `%USERPROFILE%\hackerrank_orchestrate\log.txt` |
 
-You will upload this log as your chat transcript at submission time. The chat transcript means your conversation with the AI coding tool you used to build the system. It is not the runtime logs, reasoning trace, or conversation history produced by the claim-verification agent you are building.
-
-If you use multiple AI tools, include the relevant conversation logs from all of them in the same transcript file. Separate each tool's section with a clear divider and label it with the tool name.
-
-Never paste secrets into the chat. If secrets are needed, use environment variables.
+This file is submitted as your chat transcript. Never paste secrets into chat — use `.env` variables.
 
 ---
 
 ## Submission
 
-Submit the following files as instructed by HackerRank:
+```bash
+make submit     # Runs full inference then prints checklist
+```
 
-1. **Code zip**: zip your runnable solution, README, prompts/configs, and evaluation folder. Exclude virtualenvs, `node_modules`, build artifacts, and unnecessary generated files.
-2. **Predictions CSV**: your final `output.csv` for all rows in `dataset/claims.csv`.
-3. **Chat transcript**: the `log.txt` from the path in [Chat transcript logging](#chat-transcript-logging).
+Submit to HackerRank:
 
-Before submitting, confirm:
+1. **`output.csv`** — predictions for all rows in `dataset/claims.csv`
+2. **`code.zip`** — `zip -r code.zip code/ dataset/ *.md Makefile .env.example`
+3. **Chat transcript** — `$HOME/hackerrank_orchestrate/log.txt`
 
-- `output.csv` has one row per row in `dataset/claims.csv`.
-- `output.csv` has the exact required columns in the exact required order.
-- Your evaluation files are included in `code.zip`.
-
----
-
-## Judge interview
-
-After submission, the AI Judge may ask about your approach, implementation decisions, model usage, evaluation strategy, and how you used AI while building the solution.
-
-Be prepared to explain your solution in detail.
+Pre-submission checks:
+- `output.csv` has one row per row in `dataset/claims.csv`
+- All 14 required columns present in correct order
+- `code/evaluation/evaluation_report.md` exists (run `make eval`; bundled inside `code.zip`)
+- `code/evaluation/comparison.md` exists (run `make eval-both` for the strategy comparison)
+- No API keys committed to git

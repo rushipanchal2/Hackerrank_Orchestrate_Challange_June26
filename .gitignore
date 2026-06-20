@@ -1,20 +1,32 @@
+# secrets
 .env
-.venv/
-checkpoints.db
-checkpoints.db-shm
-checkpoints.db-wal
-__pycache__/
-*.pyc
-*.pyo
-.Python
+
+# virtualenv
 .venv/
 venv/
 env/
-.DS_Store
+
+# python artifacts
+__pycache__/
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
 .pytest_cache/
-code/smoke_check.py
-code/smoke_graph.py
+.Python
+
+# langgraph checkpoints
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
+
+# run outputs
+output/
+submission/
+
+# legacy results folder
 results/
+
+# macOS
+.DS_Store

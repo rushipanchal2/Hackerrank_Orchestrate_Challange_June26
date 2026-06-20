@@ -98,10 +98,13 @@ EVIDENCE REQUIREMENTS
 
 Check each applicable requirement and assess whether the submitted image set satisfies it.
 evidence_standard_met=false if any minimum requirement is not met.
-State in evidence_standard_met_reason which requirement was checked and whether it passed.
+evidence_standard_met_reason: ONE short sentence (≤25 words). State the single deciding
+factor — do NOT list or enumerate requirement IDs. Good: "Front bumper is clearly visible
+from an angle that shows surface damage." Bad: "[REQ_CAR_BODY_PANEL] ... [REQ_GENERAL...] ...".
 
 ═══════════════════════════════════════════════════════
-OUTPUT — JSON ONLY (no markdown, no explanation)
+STRICT OUTPUT RULE — JSON ONLY: Respond with ONLY the JSON object below. No explanation, \
+no markdown fences, no text before or after. Start your response with { and end with }.
 ═══════════════════════════════════════════════════════
 
 {

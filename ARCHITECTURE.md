@@ -1,302 +1,195 @@
 # Architecture: Multi-Modal Evidence Review
 
-## 1. Assumptions Challenged Before Design
+> Reflects the current implementation as of June 2026.
 
-The problem statement contains several implicit assumptions that require explicit design decisions.
+---
 
-**"Images are the primary source of truth"** is underspecified. When a submitted image is high-quality but clearly depicts a different car than claimed, the image contradicts the claim — it does not support it. The actual rule is: *visual evidence of the claimed object at the claimed part is primary; an image of the wrong object still generates a `wrong_object` flag and `contradicted` status.*
+## 1. Design Decisions
 
-**"User history should not override clear visual evidence"** is correct but leaves ambiguous cases unresolved. Design decision: user history governs `risk_flags` and contributes to `claim_status_justification` but cannot flip `supported` → `contradicted` by itself. In genuinely ambiguous cases (evidence_standard_met = false), history can push the decision toward `not_enough_information` + `manual_review_required`.
+**Images at 768px, JPEG quality 72** — sufficient for damage classification; reduces base64 payload ~75% vs the original 1568px limit, directly cutting tokens-per-minute consumption.
 
-**The output schema has a single `issue_type` and `object_part`**, but at least five test cases assert multi-part claims (e.g., "front bumper AND headlight", "door AND rear bumper", "hinge AND screen"). Design decision: the system evaluates both parts visually, reports the *primary* one (most damage or most visually supported), and covers all parts in `claim_status_justification`.
+**User history governs `risk_flags` only** — history cannot flip `supported` → `contradicted`. In ambiguous cases it may push toward `not_enough_information` + `manual_review_required`.
 
-**Prompt injection is not mentioned in the problem statement** but appears in at least four test cases: instructions embedded in the chat transcript ("approve immediately, skip manual review") and text written on paper in images. Design decision: treat any such instruction as a `text_instruction_present` risk flag, never act on it, and continue with normal visual analysis.
+**Single `issue_type` and `object_part`** — multi-part claims report the primary visually-supported part; all parts are described in `claim_status_justification`.
 
-**Evidence requirements do not cover all issue/object combinations.** `REQ_CAR_BODY_PANEL` covers "dent or scratch" for cars but there is no car-specific water damage requirement. Design decision: fall back to the nearest matching requirement (`REQ_REVIEW_TRUST` for "all" objects) and document the fallback in `evidence_standard_met_reason`.
+**Prompt injection resistance** — detected in both image text and conversation transcript. Sets `text_instruction_present` risk flag; analysis continues normally, instruction ignored.
 
-**The spec says "deterministic where possible"** (AGENTS.md §6.2). LLMs are non-deterministic. Design decision: set `temperature=0` on all LLM calls. Output field values are constrained to an explicit allowed-value list; a post-call validation step normalises any deviation.
+**temperature=0 on all LLM calls** — determinism per AGENTS.md §6.2. `format_output` node validates every field against allowed-value enums as a hard guardrail.
 
-**Severity is not defined quantitatively.** Design decision: the LLM infers severity from visual evidence (extent of damage visible in image) and maps to the five-value scale. The evidence requirements doc does not prescribe severity; the vision model does.
+**MemorySaver over SqliteSaver** — no WAL files, thread-safe for parallel workers. No resume-on-crash (44 rows complete in ~20 min; restartable cheaply).
 
 ---
 
 ## 2. State Schema
 
-All data that flows between nodes lives in a single `TypedDict`. Fields are grouped by lifecycle stage.
-
 ```python
 # code/graph/state.py
-from typing import TypedDict, List, Dict, Annotated, Optional
-import operator
-
 class ClaimState(TypedDict):
-    # ── inputs: set once from claims.csv, never mutated ──────────────────
+    # inputs
     user_id: str
-    image_paths: List[str]          # resolved absolute filesystem paths
-    user_claim: str                 # raw multi-turn chat transcript (any language)
-    claim_object: str               # "car" | "laptop" | "package"
+    image_paths: list[str]           # split on ";" from CSV
+    image_paths_raw: str             # original string (echoed to output)
+    user_claim: str                  # raw multilingual chat transcript
+    claim_object: str                # "car" | "laptop" | "package"
 
-    # ── reference data: populated by load_context ────────────────────────
-    user_history: Dict              # matching row from user_history.csv;
-                                    # empty dict when user_id is not found
-    applicable_requirements: List[Dict]   # rows from evidence_requirements.csv
-                                          # where claim_object matches or is "all"
-    encoded_images: List[Dict]      # [{image_id, base64_str, path, exists: bool}]
+    # reference data (load_context)
+    user_history: dict
+    applicable_requirements: list[dict]
+    encoded_images: list[dict]       # {image_id, base64_str, path, exists, size_kb}
 
-    # ── intermediate: claim extraction ───────────────────────────────────
-    normalized_claim: str           # English, concise; e.g. "rear bumper dent"
-    claimed_parts: List[str]        # e.g. ["front_bumper", "headlight"]
+    # intermediate: extract_claim
+    normalized_claim: str
+    claimed_parts: list[str]
 
-    # ── intermediate: image analysis ─────────────────────────────────────
-    image_analyses: List[Dict]      # [{image_id, quality_flags, content_summary,
-                                    #   matches_claim_object, matches_claimed_part,
-                                    #   issue_visible, injection_text_present}]
-    injection_detected: bool        # true if any image or transcript contained
-                                    # an instruction to bypass review logic
+    # intermediate: analyze_images
+    image_analyses: list[dict]
+    injection_detected: bool
 
-    # ── outputs: set by synthesize_decision or make_fallback_decision ────
+    # outputs (synthesize_decision or make_fallback_decision)
     evidence_standard_met: bool
     evidence_standard_met_reason: str
-    risk_flags: List[str]           # values from allowed risk_flags enum
-    issue_type: str                 # e.g. "dent", "crack", "none"
-    object_part: str                # e.g. "rear_bumper", "screen", "seal"
-    claim_status: str               # "supported" | "contradicted" |
-                                    # "not_enough_information"
-    claim_status_justification: str # image-grounded, ≤3 sentences
-    supporting_image_ids: List[str] # e.g. ["img_1", "img_2"]; empty → ["none"]
+    risk_flags: list[str]
+    issue_type: str
+    object_part: str
+    claim_status: str
+    claim_status_justification: str
+    supporting_image_ids: list[str]
     valid_image: bool
-    severity: str                   # "none" | "low" | "medium" | "high" | "unknown"
+    severity: str
 
-    # ── error tracking: append-only across all nodes ─────────────────────
-    errors: Annotated[List[str], operator.add]
+    # error tracking (append-only via LangGraph reducer)
+    errors: Annotated[list[str], operator.add]
 ```
-
-`Annotated[List[str], operator.add]` is LangGraph's reducer pattern: concurrent or sequential node writes to `errors` are merged rather than overwriting each other.
 
 ---
 
 ## 3. Node / Edge Topology
 
-```mermaid
-graph TD
-    START(["__start__"]) --> load_context
-
-    load_context["load_context
-    ── pure Python ──
-    Look up user_history row by user_id
-    Filter evidence_requirements by claim_object
-    Resolve image paths → encode as base64
-    Sets: user_history · applicable_requirements · encoded_images"]
-
-    load_context --> extract_claim
-
-    extract_claim["extract_claim
-    ── LLM: text-only · claude-sonnet-4-6 ──
-    Normalise multilingual conversation → English
-    Extract core damage claim sentence
-    List claimed object parts
-    Sets: normalized_claim · claimed_parts"]
-
-    extract_claim --> analyze_images
-
-    analyze_images["analyze_images
-    ── LLM: vision · claude-sonnet-4-6 ──
-    Analyse each image independently:
-      quality flags · content visible · match to claim
-    Detect prompt-injection text in images or transcript
-    Sets: image_analyses · injection_detected"]
-
-    analyze_images --> route_images{"route_images
-    (conditional edge)
-    Any encoded_images
-    with exists=true?"}
-
-    route_images -->|"yes — at least one usable image"| synthesize_decision
-    route_images -->|"no — all missing or unreadable"| make_fallback_decision
-
-    synthesize_decision["synthesize_decision
-    ── LLM: text-only · claude-sonnet-4-6 ──
-    Apply applicable_requirements → evidence_standard_met
-    Incorporate user_history → risk_flags
-    Produce all 14 output fields as structured JSON
-    Sets: all output fields"]
-
-    make_fallback_decision["make_fallback_decision
-    ── pure Python ──
-    claim_status = not_enough_information
-    evidence_standard_met = false
-    valid_image = false
-    severity = unknown
-    risk_flags includes damage_not_visible"]
-
-    synthesize_decision --> format_output
-    make_fallback_decision --> format_output
-
-    format_output["format_output
-    ── pure Python ──
-    Validate each field against allowed-value lists
-    Replace invalid enums with 'unknown' / 'none'
-    Join list fields with semicolons
-    Emit final dict (one CSV row)"]
-
-    format_output --> END(["__end__"])
+```
+START
+  └─► load_context        [Python]  user history, requirements, base64 images
+        └─► extract_claim  [LLM text, 256 tok]  multilingual → English + claimed_parts
+              └─► analyze_images  [LLM vision, 768 tok]  per-image QA + injection detection
+                    ├─ (has usable images) ─► synthesize_decision  [LLM text, 512 tok]
+                    └─ (no images)         ─► make_fallback_decision  [Python]
+                                                    └─► format_output  [Python]  validate + normalise
+                                                          └─► END
 ```
 
-### Node Responsibilities in Detail
-
-| Node | Type | LLM calls | Key outputs |
+| Node | Type | max_tokens | Key outputs |
 |---|---|---|---|
-| `load_context` | Python | 0 | `user_history`, `applicable_requirements`, `encoded_images` |
-| `extract_claim` | LLM text | 1 | `normalized_claim`, `claimed_parts` |
-| `analyze_images` | LLM vision | 1 | `image_analyses`, `injection_detected` |
-| `route_images` | Python edge | 0 | routes to `synthesize_decision` or `make_fallback_decision` |
-| `synthesize_decision` | LLM text | 1 | all 14 output fields |
-| `make_fallback_decision` | Python | 0 | minimal safe defaults |
-| `format_output` | Python | 0 | final validated dict |
+| `load_context` | Python | — | `user_history`, `applicable_requirements`, `encoded_images` |
+| `extract_claim` | LLM text | **256** | `normalized_claim`, `claimed_parts` |
+| `analyze_images` | LLM vision | **768** | `image_analyses`, `injection_detected` |
+| `synthesize_decision` | LLM text | **512** | all 14 output fields |
+| `make_fallback_decision` | Python | — | safe defaults (no images case) |
+| `format_output` | Python | — | validated final dict |
 
-**LLM call budget per case: 3** (extract_claim is text-only and cheap; analyze_images is the largest call; synthesize_decision is medium).
+**3 LLM calls per claim row.**
 
 ---
 
-## 4. Tool Boundaries
+## 4. LLM Client — LiteLLM with Cooldown Routing
 
-No external tools (search, retrieval, APIs) are required. All data is local.
+File: `code/utils/llm.py`
 
-The system uses the Anthropic Python SDK via `langchain-anthropic` (`ChatAnthropic`) so nodes integrate cleanly with LangGraph's `StateGraph`.
+### Model registry
+
+| Group | Model | Vision | Key env var |
+|---|---|---|---|
+| `gemini` | `gemini/gemini-2.5-flash` | Yes | `GEMINI_API_KEY` |
+| `gemini` | `gemini/gemini-2.5-flash-lite` | Yes | `GEMINI_API_KEY` |
+| `groq1` | `groq/meta-llama/llama-4-scout-17b-16e-instruct` | Yes | `GROQ_API_KEY` |
+| `groq1` | `groq/llama-3.3-70b-versatile` | No | `GROQ_API_KEY` |
+| `groq1` | `groq/llama-3.1-8b-instant` | No | `GROQ_API_KEY` |
+| `groq2` | same 3 Groq models | — | `GROQ_API_KEY_2` *(optional, separate TPM bucket)* |
+
+### Cooldown routing
+
+Each entry has a unique key `group:model`. On 429, `retry-after` is parsed and the entry is cooled for that duration. `_sorted_entries()` always tries available entries first; no fixed-order round-robining.
+
+If all entries are cooling simultaneously: `_soonest_wait()` calculates the minimum remaining sleep, waits, retries up to 3×.
+
+### api_key passed explicitly
+
+Each `litellm.completion()` call passes `api_key=entry["api_key"]` — no reliance on env vars at call time. This enables dual-key Groq: groq1 and groq2 entries use different keys, giving independent TPM buckets.
+
+### Thread-local model tracking
+
+`_thread_local.last_model` stores the last-used model per thread. With 2 parallel workers, each thread tracks its own routing state independently.
+
+---
+
+## 5. Parallel Processing
+
+`code/main.py` uses `ThreadPoolExecutor(max_workers=2)` (configurable via `--threads`).
+
+- Rows are submitted to the pool; `as_completed()` collects results in arrival order.
+- Results are written to both CSVs in **sorted index order** (preserves claim row order for submission).
+- A `_table_lock` guards the Rich Live table updates.
+- The LangGraph graph uses `MemorySaver` — safe for concurrent invocations with different `thread_id` values.
+
+---
+
+## 6. Image Compression
+
+`code/utils/image_loader.py`:
+
+- Resize: long edge → **768px** (down from 1568px) using Pillow LANCZOS
+- Encode: JPEG quality **72**, `optimize=True`
+- Result: ~75% smaller base64 payload vs original; sufficient for visual damage classification
+- `size_kb` field returned for debugging
+
+---
+
+## 7. Output / Run Folder Structure
 
 ```
-Model:      claude-sonnet-4-6  (claude-sonnet-4-6)
-Vision:     same model — multimodal images passed as base64 content blocks
-Language:   handles English, Hindi, Hinglish, Spanish natively; no translation API needed
-temperature: 0 on all calls (deterministic per AGENTS.md §6.2)
+output/
+  run_YYYYMMDD_HHMMSS_<mode>/
+    output.csv        # predictions for this run
+    log.txt           # snapshot of $HOME/hackerrank_orchestrate/log.txt at run end
+    run_summary.txt   # row counts, timing, model used, error count
+output.csv            # root copy (always latest run, this is the submission file)
 ```
 
-`format_output` performs post-LLM validation: it checks every output field against the hard-coded allowed-value lists from the problem statement and substitutes `"unknown"` / `"none"` for any value outside the enum. This is a deterministic guardrail that makes the schema contract independent of model behaviour.
+`_cleanup_old_runs(keep=3)` runs at startup — deletes all but the 3 most recent `output/run_*` folders automatically.
 
 ---
 
-## 5. Persistence / Checkpointer Choice
+## 8. JSON Parsing — 4-Strategy Fallback
 
-**Primary choice: `SqliteSaver` with a local `checkpoints.db` file.**
+`_parse_json()` in `code/graph/nodes.py`:
 
-```python
-from langgraph.checkpoint.sqlite import SqliteSaver
-checkpointer = SqliteSaver.from_conn_string("checkpoints.db")
-```
+1. Strip markdown fences → `json.loads()`
+2. `_repair_json()` — fixes unquoted string values (e.g. `"content_summary": A car with a dent`) → `json.loads()`
+3. Extract first `{...}` block → try raw + repaired
+4. Extract last `{...}` block (model echoed schema first) → try raw + repaired
 
-Thread ID per invocation: `f"{row_index:04d}_{user_id}"` — unique per row, survives restarts.
-
-Rationale:
-- If the 45-case batch crashes at case 30, restarting picks up from case 30 without re-running the 30 completed cases and without spending tokens on them again.
-- Replaying any single case for debugging is trivial: just invoke the graph with the same thread_id and inspect the checkpoint at each node.
-- No additional infrastructure (Postgres, Redis) needed.
-
-**Alternative: `MemorySaver`** — simpler, no file I/O, appropriate for unit tests and smoke runs. Used in `conftest.py`; not for production runs.
-
-**Rejected: no checkpointer** — the 45-case run takes ~5-10 minutes. Mid-run crashes would require re-processing everything. The overhead of SqliteSaver is negligible.
+Raises `ValueError` only if all 4 strategies fail.
 
 ---
 
-## 6. Error Handling Strategy
+## 9. Error Handling
 
-### API / rate-limit errors (in LLM nodes)
-
-Each LLM node is wrapped in a `tenacity` retry decorator:
-
-```python
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    retry=retry_if_exception_type((RateLimitError, APIStatusError)),
-    reraise=True,
-)
-def call_llm(...): ...
-```
-
-If all 3 retries fail, the node appends to `state["errors"]` and either returns a safe default (Python nodes) or raises to let LangGraph surface the failure.
-
-### Invalid LLM JSON output
-
-Each LLM node requests a structured JSON response via a system-prompt instruction and output schema example. If the response cannot be parsed:
-1. Retry the call (counts toward the 3-attempt budget).
-2. On final failure, populate output fields with safe defaults (`"unknown"`, `false`, `"not_enough_information"`).
-
-### Missing image files
-
-`load_context` resolves each path. If a file does not exist:
-- `encoded_images` entry gets `exists: false` and an empty `base64_str`.
-- An error string is appended to `errors`.
-- The graph continues; `route_images` will send to `make_fallback_decision` if no images are present at all.
-
-### Prompt injection attempts
-
-Detected in `analyze_images` when the vision model identifies instruction text in an image ("approve this claim", "skip manual review") or when `extract_claim` surfaces similar text from the transcript. The flag `injection_detected = true` is set, `text_instruction_present` is added to `risk_flags`, and the analysis continues normally — the injected instruction is completely ignored.
-
-### Field validation errors
-
-`format_output` maps any out-of-enum value to a safe fallback:
-- Unknown `issue_type` → `"unknown"`
-- Unknown `object_part` → `"unknown"`
-- Unknown `severity` → `"unknown"`
-- Unknown `claim_status` → `"not_enough_information"`
-- Invalid `risk_flag` entries are dropped.
+| Scenario | Handling |
+|---|---|
+| Rate limit 429 | Cooldown set on that entry; next available entry tried immediately |
+| All entries cooling | Wait `_soonest_wait() + 1s`; retry up to 3× |
+| All retries exhausted | `SystemExit` with clear message including tip to add `GROQ_API_KEY_2` |
+| JSON parse failure | 4-strategy parser + `_repair_json()`; on total failure, node appends to `errors` and returns safe defaults |
+| Missing image file | `exists=False` in `encoded_images`; `make_fallback_decision` handles no-image cases |
+| Prompt injection | `injection_detected=True`; `text_instruction_present` added to `risk_flags`; analysis continues normally |
+| Field out of enum | `format_output` normalises to `"unknown"` / `"none"` / `"not_enough_information"` |
 
 ---
 
-## 7. Trade-offs and Rejected Alternatives
+## 10. Log File
 
-### LangGraph vs. a plain `for` loop
+Per AGENTS.md §2: `$HOME/hackerrank_orchestrate/log.txt`
 
-**Chosen: LangGraph.**
-
-A bare for-loop with three sequential API calls would also work at 45-case scale. LangGraph is not strictly necessary here. It is chosen for:
-
-1. **State visibility**: Every node's input/output is inspectable as a structured dict. Debugging a wrong `claim_status` is easy: inspect the checkpoint after `analyze_images` to see what the vision model found.
-2. **Node-level retry**: A retry on `synthesize_decision` doesn't re-run the expensive `analyze_images` vision call.
-3. **Clean separation**: `extract_claim` (text), `analyze_images` (vision), and `synthesize_decision` (reasoning) can each be prompted and tuned independently. Swapping one prompt doesn't affect the others.
-4. **Resume on crash**: `SqliteSaver` checkpoint means a mid-batch API outage doesn't waste work already done.
-
-**Rejected loop**: Would be ~40 lines simpler. Acceptable for a single-run throwaway; insufficient for iterative prompt development.
-
-### Multi-step (3 calls) vs. single-shot (1 call)
-
-**Chosen: multi-step (3 LLM calls per case).**
-
-A single prompt passing the full conversation + all images + user history + requirements and requesting all 14 output fields would work. It was tested on sample data during design. Problems observed:
-
-- **Confounding during image analysis**: when the prompt mentions "this user has a history of rejected claims", the model's visual description tends to be more negative even before weighing evidence — a form of anchoring bias.
-- **Injection leakage risk**: a single large context makes it slightly harder to maintain strict injection resistance; separating `analyze_images` from `synthesize_decision` adds an explicit "what do you see?" step that precedes any risk reasoning.
-- **Harder to iterate**: if `claim_status` accuracy is low, a single-shot prompt gives no visibility into whether the problem is in image interpretation, evidence evaluation, or risk application.
-
-The cost difference is small at this scale (~2× more calls, ~2× more tokens, still <$10 total).
-
-**Rejected single-shot**: implemented as Strategy A in the evaluation for direct comparison.
-
-### Parallel image analysis vs. a single multi-image call
-
-**Chosen: single multi-image vision call** (all images in one `analyze_images` call).
-
-Claude claude-sonnet-4-6 accepts multiple image content blocks in a single call and can reason across them (e.g., "img_1 is blurry; img_2 is the same car from a clearer angle"). Cases have at most 3 images. Parallel calls per image would:
-- Triple the call count for multi-image cases.
-- Lose cross-image reasoning (the model cannot note that img_1 and img_2 appear to be different cars unless it sees both).
-- Complicate state merging.
-
-**Rejected parallel per-image**: no benefit at ≤3 images per case.
-
-### RAG for evidence requirements
-
-**Rejected.** The `evidence_requirements.csv` contains 11 rows. All relevant rows (filtered by `claim_object` = the input object or `"all"`) are passed in-context to `synthesize_decision`. A vector store would add setup complexity with zero quality benefit for a corpus this small.
-
-### Separate specialized models per object type
-
-**Rejected.** A single system prompt with object-type-specific instruction blocks handles car, laptop, and package claims without forking the code. Adding separate model instances triples the configuration surface and provides no accuracy benefit when the model is already instructed on all three object types.
-
-### Async / parallel processing of multiple claims
-
-**Not implemented** in the main pipeline. The 45-case run takes ~5-10 minutes sequentially; a 1-second inter-case delay keeps well within the default 50 RPM limit. Parallel processing would require careful semaphore management and provides minimal wall-clock benefit given the token-per-minute limit (40 K TPM) which would be the actual bottleneck regardless.
-
----
-
-## 8. Log File
-
-Per AGENTS.md §2, a log file must be created at `$HOME/hackerrank_orchestrate/log.txt` and appended to on every agent turn. This is implemented in `code/utils/logger.py` which is called at startup (to write SESSION START) and at the end of each processing run (to record the turn summary). The log is append-only, never committed to git, and secrets are never written to it.
+- Append-only, flushed immediately after every write
+- Per-row entry written after each claim is processed (real-time)
+- Model switch events written by `llm.py` via `_announce()`
+- Snapshot copied to `output/run_*/log.txt` at end of each run
+- Never committed to git; never contains secrets

@@ -2,7 +2,6 @@
 
 import json
 import re
-import time
 
 from langgraph.types import RunnableConfig
 
@@ -15,26 +14,75 @@ from code.utils.image_loader import encode_images
 from code.utils.schema import PARTS_LIST_BY_OBJECT
 
 
-# ── JSON extraction helper ────────────────────────────────────────────────────
+# ── JSON extraction (3-strategy, robust for all free models) ─────────────────
+
+def _repair_json(text: str) -> str:
+    """Fix common model JSON mistakes: unquoted string values after string keys."""
+    # Fix: "key": unquoted value, → "key": "unquoted value",
+    # Matches string keys whose value starts without a quote, bool, number, [ or {
+    text = re.sub(
+        r'("(?:[^"\\]|\\.)*"\s*:\s*)([^",\[\]{}0-9tfn\s\-][^,\n\]}\'"]*)',
+        lambda m: m.group(1) + '"' + m.group(2).strip().rstrip(',').strip() + '"',
+        text,
+    )
+    return text
+
 
 def _parse_json(text: str) -> dict:
-    """Extract JSON from LLM response, stripping markdown fences if present."""
+    """Extract JSON from LLM response using 4 fallback strategies.
+
+    Strategy 1: strip markdown fences, parse directly.
+    Strategy 2: repair common model mistakes (unquoted strings), then parse.
+    Strategy 3: find the first {...} block via regex (handles prose prefix/suffix).
+    Strategy 4: find the last {...} block (some models repeat the schema first).
+    """
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text.strip())
+
+    # Strategy 1 — strip fences and try direct parse
+    clean = re.sub(r"^```(?:json)?\s*", "", text)
+    clean = re.sub(r"\s*```\s*$", "", clean).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2 — repair unquoted string values, then parse
+    try:
+        return json.loads(_repair_json(clean))
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 3 — extract first balanced {...} block
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        block = brace_match.group()
+        for candidate in (block, _repair_json(block)):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+    # Strategy 4 — find last {...} block (model repeated schema then answered)
+    all_blocks = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
+    for block in reversed(all_blocks):
+        for candidate in (block, _repair_json(block)):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+    raise ValueError(f"No valid JSON found in model response. Response was:\n{text[:300]}")
 
 
-# ── LLM call wrappers (provider-agnostic; see code/utils/llm.py) ───────────────
+# ── LLM call wrappers ─────────────────────────────────────────────────────────
 
-def _text_call(system: str, user: str, max_tokens: int = 1024,
-               provider: str | None = None) -> str:
-    return llm.text_call(system, user, max_tokens, provider=provider)
+def _text_call(system: str, user: str, max_tokens: int = 1024) -> str:
+    return llm.text_call(system, user, max_tokens)
 
 
-def _vision_call(system: str, images: list, text: str, max_tokens: int = 2048,
-                 provider: str | None = None) -> str:
-    return llm.vision_call(system, images, text, max_tokens, provider=provider)
+def _vision_call(system: str, images: list, text: str,
+                 max_tokens: int = 2048) -> str:
+    return llm.vision_call(system, images, text, max_tokens)
 
 
 # ── Node 1: load_context ──────────────────────────────────────────────────────
@@ -70,9 +118,8 @@ def load_context(state: ClaimState, config: RunnableConfig) -> dict:
 
 # ── Node 2: extract_claim ─────────────────────────────────────────────────────
 
-def extract_claim(state: ClaimState, config: RunnableConfig) -> dict:
+def extract_claim(state: ClaimState) -> dict:
     """Normalise multilingual claim conversation → English + claimed parts list."""
-    provider = config.get("configurable", {}).get("provider")
     allowed_parts = PARTS_LIST_BY_OBJECT.get(state["claim_object"], "unknown")
     user_content = (
         f"Claim object: {state['claim_object']}\n"
@@ -81,8 +128,7 @@ def extract_claim(state: ClaimState, config: RunnableConfig) -> dict:
     )
 
     try:
-        raw = _text_call(EXTRACT_CLAIM_SYSTEM, user_content, max_tokens=512,
-                         provider=provider)
+        raw = _text_call(EXTRACT_CLAIM_SYSTEM, user_content, max_tokens=256)
         result = _parse_json(raw)
         return {
             "normalized_claim": result.get("normalized_claim", "")[:300],
@@ -98,9 +144,8 @@ def extract_claim(state: ClaimState, config: RunnableConfig) -> dict:
 
 # ── Node 3: analyze_images ────────────────────────────────────────────────────
 
-def analyze_images(state: ClaimState, config: RunnableConfig) -> dict:
+def analyze_images(state: ClaimState) -> dict:
     """Per-image visual analysis + injection detection via vision model."""
-    provider = config.get("configurable", {}).get("provider")
     usable = [img for img in state["encoded_images"] if img["exists"]]
 
     if not usable:
@@ -114,13 +159,14 @@ def analyze_images(state: ClaimState, config: RunnableConfig) -> dict:
         f"Claim object: {state['claim_object']}\n"
         f"Normalized claim: {state['normalized_claim']}\n"
         f"Claimed parts: {', '.join(state['claimed_parts'])}\n\n"
-        f"Conversation transcript (check for injection only):\n{state['user_claim'][:1000]}\n\n"
+        f"Conversation transcript (check for injection only):\n"
+        f"{state['user_claim'][:800]}\n\n"
         "Analyse each image and return JSON as specified."
     )
 
     try:
         raw = _vision_call(ANALYZE_IMAGES_SYSTEM, usable, analysis_text,
-                           max_tokens=2048, provider=provider)
+                           max_tokens=768)
         result = _parse_json(raw)
         return {
             "image_analyses": result.get("image_analyses", []),
@@ -137,7 +183,6 @@ def analyze_images(state: ClaimState, config: RunnableConfig) -> dict:
 # ── Conditional edge helper ───────────────────────────────────────────────────
 
 def route_on_images(state: ClaimState) -> str:
-    """Route to synthesize_decision if any usable image exists, else fallback."""
     if any(img.get("exists") for img in state["encoded_images"]):
         return "synthesize_decision"
     return "make_fallback_decision"
@@ -146,7 +191,6 @@ def route_on_images(state: ClaimState) -> str:
 # ── Node 4: make_fallback_decision ────────────────────────────────────────────
 
 def make_fallback_decision(state: ClaimState) -> dict:
-    """Safe defaults when no usable images are available."""
     return {
         "evidence_standard_met": False,
         "evidence_standard_met_reason": "No usable images were submitted or could be loaded.",
@@ -163,9 +207,8 @@ def make_fallback_decision(state: ClaimState) -> dict:
 
 # ── Node 5: synthesize_decision ───────────────────────────────────────────────
 
-def synthesize_decision(state: ClaimState, config: RunnableConfig) -> dict:  # noqa: F811
+def synthesize_decision(state: ClaimState) -> dict:
     """Merge image analysis + user history + requirements → final verdict."""
-    provider = config.get("configurable", {}).get("provider")
     reqs_text = "\n".join(
         f"- [{r['requirement_id']}] {r['applies_to']}: {r['minimum_image_evidence']}"
         for r in state["applicable_requirements"]
@@ -195,8 +238,7 @@ def synthesize_decision(state: ClaimState, config: RunnableConfig) -> dict:  # n
     )
 
     try:
-        raw = _text_call(SYNTHESIZE_DECISION_SYSTEM, user_content, max_tokens=1024,
-                         provider=provider)
+        raw = _text_call(SYNTHESIZE_DECISION_SYSTEM, user_content, max_tokens=512)
         result = _parse_json(raw)
         return {
             "evidence_standard_met": bool(result.get("evidence_standard_met", False)),

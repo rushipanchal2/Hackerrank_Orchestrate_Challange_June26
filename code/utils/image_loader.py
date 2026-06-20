@@ -1,4 +1,4 @@
-"""Image loading and base64 encoding for Claude vision calls."""
+"""Image loading and base64 encoding for vision calls."""
 
 import base64
 import io
@@ -6,27 +6,19 @@ import pathlib
 
 from PIL import Image
 
-# Anthropic resizes any image to a long edge of ~1568px / ~1.15MP server-side before the
-# model sees it, so downsizing to this here is lossless in terms of model input — it only
-# avoids the API's 5MB-per-image 400 error on very large source files.
-_MAX_EDGE = 1568
+# 768px long-edge is sufficient for damage detection; produces ~75% smaller
+# base64 payloads than the original 1568px limit, saving tokens and latency.
+_MAX_EDGE = 768
+_JPEG_QUALITY = 72   # visually fine for damage classification; further reduces size
 
 
 def encode_images(
     csv_paths: list[str],
     images_base_dir: str | pathlib.Path,
 ) -> list[dict]:
-    """
-    Resolve and base64-encode images.
+    """Resolve and base64-encode images with compression.
 
-    csv_paths  : path strings exactly as they appear in the CSV
-                 (e.g. 'images/test/case_001/img_1.jpg')
-    images_base_dir : root directory to prepend
-                 (e.g. 'dataset') so the resolved path becomes
-                 'dataset/images/test/case_001/img_1.jpg'
-
-    Returns a list of dicts:
-      {image_id, base64_str, path (absolute str), exists (bool)}
+    Returns list of {image_id, base64_str, path, exists, size_kb}.
     """
     base = pathlib.Path(images_base_dir)
     result = []
@@ -36,7 +28,7 @@ def encode_images(
         if not csv_path:
             continue
 
-        image_id = pathlib.Path(csv_path).stem  # e.g. 'img_1'
+        image_id = pathlib.Path(csv_path).stem
         resolved = (base / csv_path).resolve()
 
         if not resolved.exists():
@@ -53,13 +45,15 @@ def encode_images(
             if max(img.size) > _MAX_EDGE:
                 img.thumbnail((_MAX_EDGE, _MAX_EDGE), Image.LANCZOS)
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            img.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+            raw = buf.getvalue()
+            b64 = base64.b64encode(raw).decode("utf-8")
             result.append({
                 "image_id": image_id,
                 "base64_str": b64,
                 "path": str(resolved),
                 "exists": True,
+                "size_kb": round(len(raw) / 1024, 1),
             })
         except Exception as exc:
             result.append({

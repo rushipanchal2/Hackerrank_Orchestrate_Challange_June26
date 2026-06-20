@@ -10,15 +10,16 @@ def open_writer(path: str | pathlib.Path):
     """Open output.csv and write the header. Returns (writer, file_handle)."""
     fh = open(path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=REQUIRED_COLUMNS, extrasaction="ignore")
+    writer._fh = fh  # attach for flush access
     writer.writeheader()
     return writer, fh
 
 
 def write_row(writer: csv.DictWriter, state: dict) -> None:
-    """Validate and write one row. Uses image_paths_raw for verbatim path echo."""
+    """Validate and write one row. Flushes immediately for real-time tailing."""
     row = {
         "user_id": state.get("user_id", ""),
-        "image_paths": state.get("image_paths_raw", ""),   # verbatim original string
+        "image_paths": state.get("image_paths_raw", ""),
         "user_claim": state.get("user_claim", ""),
         "claim_object": state.get("claim_object", ""),
         "evidence_standard_met": state.get("evidence_standard_met", False),
@@ -34,6 +35,7 @@ def write_row(writer: csv.DictWriter, state: dict) -> None:
     }
     validated = validate_row(row, claim_object=state.get("claim_object", ""))
     writer.writerow(validated)
+    writer._fh.flush()
 
 
 def close_writer(writer: csv.DictWriter, fh) -> None:  # noqa: ANN001
